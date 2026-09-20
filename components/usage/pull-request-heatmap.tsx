@@ -60,14 +60,21 @@ export function PullRequestHeatmap({ activity }: { activity: PullRequestActivity
       <div className="pr-activity-grid" role="img" aria-label={label}>
         {cells.map((cell) =>
           cell.day ? (
-            <span
-              key={cell.key}
-              className="pr-activity-cell"
-              data-level={cell.level}
-              title={`${cell.count} pull request${cell.count === 1 ? "" : "s"} on ${DATE_FORMAT.format(
+            (() => {
+              const tooltip = `${cell.count} pull request${cell.count === 1 ? "" : "s"} on ${DATE_FORMAT.format(
                 new Date(`${cell.day}T00:00:00Z`),
-              )}`}
-            />
+              )}`;
+              return (
+                <span
+                  key={cell.key}
+                  className="pr-activity-cell"
+                  data-level={cell.level}
+                  data-tooltip={tooltip}
+                  title={tooltip}
+                  aria-label={tooltip}
+                />
+              );
+            })()
           ) : (
             <span key={cell.key} className="pr-activity-cell pr-activity-empty" aria-hidden />
           ),
