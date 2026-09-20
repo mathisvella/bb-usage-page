@@ -119,7 +119,12 @@ async function readPullRequestActivity(now = new Date()): Promise<PullRequestAct
             `d${start + index}: search(query: ${JSON.stringify(`is:pr author:${login} created:${day}`)}, type: ISSUE, first: 1) { issueCount }`,
         )
         .join("\n");
-      const raw = await runGitHubCli(["api", "graphql", "-f", `query={${fields}}`]);
+      const raw = await runGitHubCli([
+        "api",
+        "graphql",
+        "-f",
+        `query=query PullRequestCounts {${fields}}`,
+      ]);
       return searchResultSchema.parse(JSON.parse(raw)).data;
     }),
   );
