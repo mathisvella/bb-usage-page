@@ -19,15 +19,6 @@ import type { MergedUsage, ProjectTotals } from "./lib/types";
 const USAGE_COMMAND = "bb usage show [--days 7|30|90] [--force]";
 const execFileAsync = promisify(execFile);
 const PULL_REQUEST_CACHE_MS = 10 * 60 * 1_000;
-const PULL_REQUEST_SEARCH_QUERY = `
-  query($q: String!, $after: String) {
-    search(query: $q, type: ISSUE, first: 100, after: $after) {
-      issueCount
-      pageInfo { hasNextPage endCursor }
-      nodes { ... on PullRequest { createdAt } }
-    }
-  }
-`;
 
 const pullRequestActivitySchema = z.object({
   login: z.string().min(1),
@@ -102,70 +93,35 @@ async function runGitHubCli(args: string[]): Promise<string> {
   return stdout;
 }
 
-/** Fetch every authored PR without REST search's 30-requests-per-minute limit. */
+/** Fetch one exact GitHub search count per day in one GraphQL request. */
 async function readPullRequestActivity(now = new Date()): Promise<PullRequestActivity> {
   const login = (await runGitHubCli(["api", "user", "--jq", ".login"])).trim();
   if (!login) throw new Error("GitHub is not signed in on this BB host.");
 
   const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   const firstDay = addUtcDays(today, -364);
-  const counts = new Map<string, number>();
+  const days: string[] = [];
   for (let day = firstDay; day <= today; day = addUtcDays(day, 1)) {
-    counts.set(utcDay(day), 0);
+    days.push(utcDay(day));
   }
 
   const searchResultSchema = z.object({
-    data: z.object({
-      search: z.object({
-        issueCount: z.number().int().nonnegative(),
-        pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
-        nodes: z.array(z.object({ createdAt: z.string().datetime().nullable() })),
-      }),
-    }),
+    data: z.record(z.string(), z.object({ issueCount: z.number().int().nonnegative() })),
   });
-
-  async function search(query: string, after?: string) {
-    const args = ["api", "graphql", "-f", `query=${PULL_REQUEST_SEARCH_QUERY}`, "-f", `q=${query}`];
-    if (after) args.push("-f", `after=${after}`);
-    const raw = await runGitHubCli(args);
-    return searchResultSchema.parse(JSON.parse(raw)).data.search;
-  }
-
-  async function collectRange(start: Date, end: Date): Promise<number> {
-    const query = `is:pr author:${login} created:${utcDay(start)}..${utcDay(end)}`;
-    let page = await search(query);
-
-    // GitHub search exposes an exact count but only lets us page through 1,000
-    // items. Split a busy period until every individual PR can be read. If a
-    // single day itself exceeds 1,000, the count is still exact by definition.
-    if (page.issueCount > 1_000) {
-      if (utcDay(start) === utcDay(end)) {
-        counts.set(utcDay(start), page.issueCount);
-        return page.issueCount;
-      }
-      const dayCount = Math.floor((end.getTime() - start.getTime()) / 86_400_000);
-      const middle = addUtcDays(start, Math.floor(dayCount / 2));
-      return (await collectRange(start, middle)) + (await collectRange(addUtcDays(middle, 1), end));
-    }
-
-    for (;;) {
-      for (const pullRequest of page.nodes) {
-        if (!pullRequest.createdAt) continue;
-        const day = pullRequest.createdAt.slice(0, 10);
-        if (counts.has(day)) counts.set(day, (counts.get(day) ?? 0) + 1);
-      }
-      if (!page.pageInfo.hasNextPage || !page.pageInfo.endCursor) break;
-      page = await search(query, page.pageInfo.endCursor);
-    }
-    return page.issueCount;
-  }
-
-  const total = await collectRange(firstDay, today);
+  const fields = days
+    .map(
+      (day, index) =>
+        `d${index}: search(query: ${JSON.stringify(`is:pr author:${login} created:${day}`)}, type: ISSUE, first: 1) { issueCount }`,
+    )
+    .join("\n");
+  const raw = await runGitHubCli(["api", "graphql", "-f", `query={${fields}}`]);
+  const results = searchResultSchema.parse(JSON.parse(raw)).data;
+  const activity = days.map((day, index) => ({ day, count: results[`d${index}`]?.issueCount ?? 0 }));
 
   return {
     login,
-    days: [...counts].map(([day, count]) => ({ day, count })),
-    total,
+    days: activity,
+    total: activity.reduce((sum, { count }) => sum + count, 0),
     incomplete: false,
   };
 }
