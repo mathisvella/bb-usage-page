@@ -64,9 +64,6 @@ export function PullRequestHeatmap({ activity }: { activity: PullRequestActivity
               key={cell.key}
               className="pr-activity-cell"
               data-level={cell.level}
-              title={`${cell.count} pull request${cell.count === 1 ? "" : "s"} on ${DATE_FORMAT.format(
-                new Date(`${cell.day}T00:00:00Z`),
-              )}`}
             />
           ) : (
             <span key={cell.key} className="pr-activity-cell pr-activity-empty" aria-hidden />
