@@ -85,10 +85,6 @@ function addUtcDays(value: Date, days: number): Date {
   return next;
 }
 
-function endOfUtcMonth(value: Date): Date {
-  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth() + 1, 0));
-}
-
 async function runGitHubCli(args: string[]): Promise<string> {
   const { stdout } = await execFileAsync("gh", args, {
     timeout: 60_000,
@@ -97,11 +93,7 @@ async function runGitHubCli(args: string[]): Promise<string> {
   return stdout;
 }
 
-/**
- * GitHub search caps one query at 1,000 items. Querying one month at a time
- * keeps a very active year accurate instead of returning a quiet-looking graph
- * with activity omitted after the first thousand pull requests.
- */
+/** GitHub search returns at most 1,000 items for one query. */
 async function readPullRequestActivity(now = new Date()): Promise<PullRequestActivity> {
   const login = (await runGitHubCli(["api", "user", "--jq", ".login"])).trim();
   if (!login) throw new Error("GitHub is not signed in on this BB host.");
@@ -113,45 +105,38 @@ async function readPullRequestActivity(now = new Date()): Promise<PullRequestAct
     counts.set(utcDay(day), 0);
   }
 
-  let total = 0;
-  let incomplete = false;
-  for (let monthStart = firstDay; monthStart <= today; ) {
-    const monthEnd = new Date(Math.min(endOfUtcMonth(monthStart).getTime(), today.getTime()));
-    const query = `is:pr author:${login} created:${utcDay(monthStart)}..${utcDay(monthEnd)}`;
-    const endpoint = `/search/issues?q=${encodeURIComponent(query)}&per_page=100&sort=created&order=asc`;
-    const raw = await runGitHubCli([
-      "api",
-      "--paginate",
-      "--slurp",
-      "-H",
-      "Accept: application/vnd.github+json",
-      endpoint,
-    ]);
-    const pages = z
-      .array(
-        z.object({
-          total_count: z.number().int().nonnegative(),
-          incomplete_results: z.boolean(),
-          items: z.array(z.object({ created_at: z.string().datetime() })),
-        }),
-      )
-      .parse(JSON.parse(raw));
-    const resultCount = pages[0]?.total_count ?? 0;
-    total += Math.min(resultCount, 1_000);
-    incomplete ||= resultCount > 1_000 || pages.some((page) => page.incomplete_results);
-    for (const page of pages) {
-      for (const pullRequest of page.items) {
-        const day = pullRequest.created_at.slice(0, 10);
-        if (counts.has(day)) counts.set(day, (counts.get(day) ?? 0) + 1);
-      }
+  const query = `is:pr author:${login} created:${utcDay(firstDay)}..${utcDay(today)}`;
+  const endpoint = `/search/issues?q=${encodeURIComponent(query)}&per_page=100&sort=created&order=asc`;
+  const raw = await runGitHubCli([
+    "api",
+    "--paginate",
+    "--slurp",
+    "-H",
+    "Accept: application/vnd.github+json",
+    endpoint,
+  ]);
+  const pages = z
+    .array(
+      z.object({
+        total_count: z.number().int().nonnegative(),
+        incomplete_results: z.boolean(),
+        items: z.array(z.object({ created_at: z.string().datetime() })),
+      }),
+    )
+    .parse(JSON.parse(raw));
+  const resultCount = pages[0]?.total_count ?? 0;
+  const incomplete = resultCount > 1_000 || pages.some((page) => page.incomplete_results);
+  for (const page of pages) {
+    for (const pullRequest of page.items) {
+      const day = pullRequest.created_at.slice(0, 10);
+      if (counts.has(day)) counts.set(day, (counts.get(day) ?? 0) + 1);
     }
-    monthStart = addUtcDays(monthEnd, 1);
   }
 
   return {
     login,
     days: [...counts].map(([day, count]) => ({ day, count })),
-    total,
+    total: Math.min(resultCount, 1_000),
     incomplete,
   };
 }
