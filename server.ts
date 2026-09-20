@@ -19,6 +19,15 @@ import type { MergedUsage, ProjectTotals } from "./lib/types";
 const USAGE_COMMAND = "bb usage show [--days 7|30|90] [--force]";
 const execFileAsync = promisify(execFile);
 const PULL_REQUEST_CACHE_MS = 10 * 60 * 1_000;
+const PULL_REQUEST_SEARCH_QUERY = `
+  query($q: String!, $after: String) {
+    search(query: $q, type: ISSUE, first: 100, after: $after) {
+      issueCount
+      pageInfo { hasNextPage endCursor }
+      nodes { ... on PullRequest { createdAt } }
+    }
+  }
+`;
 
 const pullRequestActivitySchema = z.object({
   login: z.string().min(1),
@@ -85,10 +94,6 @@ function addUtcDays(value: Date, days: number): Date {
   return next;
 }
 
-function addUtcMonths(value: Date, months: number): Date {
-  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth() + months, value.getUTCDate()));
-}
-
 async function runGitHubCli(args: string[]): Promise<string> {
   const { stdout } = await execFileAsync("gh", args, {
     timeout: 60_000,
@@ -97,11 +102,7 @@ async function runGitHubCli(args: string[]): Promise<string> {
   return stdout;
 }
 
-/**
- * GitHub search returns at most 1,000 items per query and has a tighter rate
- * limit than the core API. Three-month slices retain every PR while keeping a
- * full year's initial load safely below that rate limit.
- */
+/** Fetch every authored PR without REST search's 30-requests-per-minute limit. */
 async function readPullRequestActivity(now = new Date()): Promise<PullRequestActivity> {
   const login = (await runGitHubCli(["api", "user", "--jq", ".login"])).trim();
   if (!login) throw new Error("GitHub is not signed in on this BB host.");
@@ -114,45 +115,58 @@ async function readPullRequestActivity(now = new Date()): Promise<PullRequestAct
   }
 
   const searchResultSchema = z.object({
-    total_count: z.number().int().nonnegative(),
-    incomplete_results: z.boolean(),
-    items: z.array(z.object({ created_at: z.string().datetime() })),
+    data: z.object({
+      search: z.object({
+        issueCount: z.number().int().nonnegative(),
+        pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+        nodes: z.array(z.object({ createdAt: z.string().datetime().nullable() })),
+      }),
+    }),
   });
-  let total = 0;
-  let incomplete = false;
-  for (let periodStart = firstDay; periodStart <= today; ) {
-    const nextPeriod = addUtcMonths(periodStart, 3);
-    const periodEnd = new Date(Math.min(addUtcDays(nextPeriod, -1).getTime(), today.getTime()));
-    const query = `is:pr author:${login} created:${utcDay(periodStart)}..${utcDay(periodEnd)}`;
-    const queryPrefix = `/search/issues?q=${encodeURIComponent(query)}&per_page=100&sort=created&order=asc`;
-    let pages = 1;
-    for (let page = 1; page <= pages; page += 1) {
-      const raw = await runGitHubCli([
-        "api",
-        "-H",
-        "Accept: application/vnd.github+json",
-        `${queryPrefix}&page=${page}`,
-      ]);
-      const result = searchResultSchema.parse(JSON.parse(raw));
-      if (page === 1) {
-        total += Math.min(result.total_count, 1_000);
-        pages = Math.min(Math.ceil(result.total_count / 100), 10);
-        incomplete ||= result.total_count > 1_000;
+
+  async function search(query: string, after?: string) {
+    const args = ["api", "graphql", "-f", `query=${PULL_REQUEST_SEARCH_QUERY}`, "-f", `q=${query}`];
+    if (after) args.push("-f", `after=${after}`);
+    const raw = await runGitHubCli(args);
+    return searchResultSchema.parse(JSON.parse(raw)).data.search;
+  }
+
+  async function collectRange(start: Date, end: Date): Promise<number> {
+    const query = `is:pr author:${login} created:${utcDay(start)}..${utcDay(end)}`;
+    let page = await search(query);
+
+    // GitHub search exposes an exact count but only lets us page through 1,000
+    // items. Split a busy period until every individual PR can be read. If a
+    // single day itself exceeds 1,000, the count is still exact by definition.
+    if (page.issueCount > 1_000) {
+      if (utcDay(start) === utcDay(end)) {
+        counts.set(utcDay(start), page.issueCount);
+        return page.issueCount;
       }
-      incomplete ||= result.incomplete_results;
-      for (const pullRequest of result.items) {
-        const day = pullRequest.created_at.slice(0, 10);
+      const dayCount = Math.floor((end.getTime() - start.getTime()) / 86_400_000);
+      const middle = addUtcDays(start, Math.floor(dayCount / 2));
+      return (await collectRange(start, middle)) + (await collectRange(addUtcDays(middle, 1), end));
+    }
+
+    for (;;) {
+      for (const pullRequest of page.nodes) {
+        if (!pullRequest.createdAt) continue;
+        const day = pullRequest.createdAt.slice(0, 10);
         if (counts.has(day)) counts.set(day, (counts.get(day) ?? 0) + 1);
       }
+      if (!page.pageInfo.hasNextPage || !page.pageInfo.endCursor) break;
+      page = await search(query, page.pageInfo.endCursor);
     }
-    periodStart = nextPeriod;
+    return page.issueCount;
   }
+
+  const total = await collectRange(firstDay, today);
 
   return {
     login,
     days: [...counts].map(([day, count]) => ({ day, count })),
     total,
-    incomplete,
+    incomplete: false,
   };
 }
 
