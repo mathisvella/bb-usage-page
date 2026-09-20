@@ -108,14 +108,22 @@ async function readPullRequestActivity(now = new Date()): Promise<PullRequestAct
   const searchResultSchema = z.object({
     data: z.record(z.string(), z.object({ issueCount: z.number().int().nonnegative() })),
   });
-  const fields = days
-    .map(
-      (day, index) =>
-        `d${index}: search(query: ${JSON.stringify(`is:pr author:${login} created:${day}`)}, type: ISSUE, first: 1) { issueCount }`,
-    )
-    .join("\n");
-  const raw = await runGitHubCli(["api", "graphql", "-f", `query={${fields}}`]);
-  const results = searchResultSchema.parse(JSON.parse(raw)).data;
+  const batchSize = 92;
+  const responses = await Promise.all(
+    Array.from({ length: Math.ceil(days.length / batchSize) }, async (_, batchIndex) => {
+      const start = batchIndex * batchSize;
+      const fields = days
+        .slice(start, start + batchSize)
+        .map(
+          (day, index) =>
+            `d${start + index}: search(query: ${JSON.stringify(`is:pr author:${login} created:${day}`)}, type: ISSUE, first: 1) { issueCount }`,
+        )
+        .join("\n");
+      const raw = await runGitHubCli(["api", "graphql", "-f", `query={${fields}}`]);
+      return searchResultSchema.parse(JSON.parse(raw)).data;
+    }),
+  );
+  const results = Object.assign({}, ...responses);
   const activity = days.map((day, index) => ({ day, count: results[`d${index}`]?.issueCount ?? 0 }));
 
   return {
