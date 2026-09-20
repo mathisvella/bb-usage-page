@@ -15,6 +15,7 @@ import {
   makeWindow,
 } from "../../lib/format";
 import { PROVIDER_COLOR, PROVIDER_LABEL, ProviderMark } from "./providers";
+import { PullRequestHeatmap, type PullRequestActivity } from "./pull-request-heatmap";
 import { UsageChartLegend, UsageProviderChart } from "./usage-chart";
 
 const WINDOW_OPTIONS = [
@@ -41,8 +42,12 @@ export function UsagePage() {
   const [showSkeleton, setShowSkeleton] = useState(true);
   const [reloadKey, setReloadKey] = useState(0);
   const [windowVersion, setWindowVersion] = useState(0);
+  const [pullRequests, setPullRequests] = useState<PullRequestActivity | null>(null);
+  const [pullRequestError, setPullRequestError] = useState<string | null>(null);
+  const [pullRequestReloadKey, setPullRequestReloadKey] = useState(0);
   const hasLoadedRef = useRef(false);
   const forceRefreshRef = useRef(false);
+  const forcePullRequestRefreshRef = useRef(false);
 
   const window = useMemo(() => makeWindow(windowDays), [windowDays, windowVersion]);
   const dataMatchesWindow =
@@ -100,6 +105,24 @@ export function UsagePage() {
       if (force && !settled) forceRefreshRef.current = true;
     };
   }, [rpc, reloadKey, window.sinceDay, window.timeZone, window.untilDay, windowDays]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const force = forcePullRequestRefreshRef.current;
+    forcePullRequestRefreshRef.current = false;
+    setPullRequestError(null);
+    void rpc
+      .call("getPullRequestActivity", { force })
+      .then((result) => {
+        if (!cancelled) setPullRequests(result);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setPullRequestError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [rpc, pullRequestReloadKey]);
 
   useEffect(() => {
     const nextMidnight = new Date();
@@ -192,7 +215,9 @@ export function UsagePage() {
               type="button"
               onClick={() => {
                 forceRefreshRef.current = true;
+                forcePullRequestRefreshRef.current = true;
                 setReloadKey((value) => value + 1);
+                setPullRequestReloadKey((value) => value + 1);
               }}
               aria-label="Refresh usage"
               disabled={refreshing}
@@ -214,6 +239,12 @@ export function UsagePage() {
           </div>
         ) : merged ? (
           <>
+            {pullRequests ? <PullRequestHeatmap activity={pullRequests} /> : null}
+            {pullRequestError ? (
+              <p className="text-xs text-muted-foreground">
+                Pull request activity is unavailable: {pullRequestError}
+              </p>
+            ) : null}
             {cursorWarning ? (
               <div
                 role="status"

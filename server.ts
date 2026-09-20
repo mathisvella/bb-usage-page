@@ -1,4 +1,6 @@
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { z } from "zod";
 
 import { isValidTimeZone, makeWindow } from "./lib/format";
@@ -15,6 +17,22 @@ import { UsageScanner } from "./lib/scan";
 import type { MergedUsage, ProjectTotals } from "./lib/types";
 
 const USAGE_COMMAND = "bb usage show [--days 7|30|90] [--force]";
+const execFileAsync = promisify(execFile);
+const PULL_REQUEST_CACHE_MS = 10 * 60 * 1_000;
+
+const pullRequestActivitySchema = z.object({
+  login: z.string().min(1),
+  days: z.array(
+    z.object({
+      day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      count: z.number().int().nonnegative(),
+    }),
+  ),
+  total: z.number().int().nonnegative(),
+  incomplete: z.boolean(),
+});
+
+type PullRequestActivity = z.infer<typeof pullRequestActivitySchema>;
 
 const daySchema = z
   .string()
@@ -51,7 +69,92 @@ export const rpcContract = defineRpcContract({
       }),
     output: mergedUsageSchema,
   },
+  getPullRequestActivity: {
+    input: z.object({ force: z.boolean().optional() }).strict(),
+    output: pullRequestActivitySchema,
+  },
 });
+
+function utcDay(value: Date): string {
+  return value.toISOString().slice(0, 10);
+}
+
+function addUtcDays(value: Date, days: number): Date {
+  const next = new Date(value);
+  next.setUTCDate(next.getUTCDate() + days);
+  return next;
+}
+
+function endOfUtcMonth(value: Date): Date {
+  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth() + 1, 0));
+}
+
+async function runGitHubCli(args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("gh", args, {
+    timeout: 60_000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  return stdout;
+}
+
+/**
+ * GitHub search caps one query at 1,000 items. Querying one month at a time
+ * keeps a very active year accurate instead of returning a quiet-looking graph
+ * with activity omitted after the first thousand pull requests.
+ */
+async function readPullRequestActivity(now = new Date()): Promise<PullRequestActivity> {
+  const login = (await runGitHubCli(["api", "user", "--jq", ".login"])).trim();
+  if (!login) throw new Error("GitHub is not signed in on this BB host.");
+
+  const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const firstDay = addUtcDays(today, -364);
+  const counts = new Map<string, number>();
+  for (let day = firstDay; day <= today; day = addUtcDays(day, 1)) {
+    counts.set(utcDay(day), 0);
+  }
+
+  let total = 0;
+  let incomplete = false;
+  for (let monthStart = firstDay; monthStart <= today; ) {
+    const monthEnd = new Date(Math.min(endOfUtcMonth(monthStart).getTime(), today.getTime()));
+    const query = `is:pr author:${login} created:${utcDay(monthStart)}..${utcDay(monthEnd)}`;
+    const endpoint = `/search/issues?q=${encodeURIComponent(query)}&per_page=100&sort=created&order=asc`;
+    const raw = await runGitHubCli([
+      "api",
+      "--paginate",
+      "--slurp",
+      "-H",
+      "Accept: application/vnd.github+json",
+      endpoint,
+    ]);
+    const pages = z
+      .array(
+        z.object({
+          total_count: z.number().int().nonnegative(),
+          incomplete_results: z.boolean(),
+          items: z.array(z.object({ created_at: z.string().datetime() })),
+        }),
+      )
+      .parse(JSON.parse(raw));
+    const resultCount = pages[0]?.total_count ?? 0;
+    total += Math.min(resultCount, 1_000);
+    incomplete ||= resultCount > 1_000 || pages.some((page) => page.incomplete_results);
+    for (const page of pages) {
+      for (const pullRequest of page.items) {
+        const day = pullRequest.created_at.slice(0, 10);
+        if (counts.has(day)) counts.set(day, (counts.get(day) ?? 0) + 1);
+      }
+    }
+    monthStart = addUtcDays(monthEnd, 1);
+  }
+
+  return {
+    login,
+    days: [...counts].map(([day, count]) => ({ day, count })),
+    total,
+    incomplete,
+  };
+}
 
 type UsageCliOptions =
   | { days: 7 | 30 | 90; force: boolean }
@@ -208,6 +311,7 @@ export default async function plugin(bb: BbPluginApi) {
     dataDir: USAGE_DATA_DIR,
     log: (message) => bb.log.info(message),
   });
+  let pullRequestCache: { value: PullRequestActivity; expiresAt: number } | null = null;
 
   async function cursorOptions() {
     const values = await settings.get();
@@ -246,6 +350,14 @@ export default async function plugin(bb: BbPluginApi) {
         cursor: await cursorOptions(),
       });
       return resolveUsage(merged);
+    },
+    async getPullRequestActivity({ force }) {
+      if (!force && pullRequestCache && pullRequestCache.expiresAt > Date.now()) {
+        return pullRequestCache.value;
+      }
+      const value = await readPullRequestActivity();
+      pullRequestCache = { value, expiresAt: Date.now() + PULL_REQUEST_CACHE_MS };
+      return value;
     },
   });
 
