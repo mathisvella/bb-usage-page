@@ -108,7 +108,7 @@ async function readPullRequestActivity(now = new Date()): Promise<PullRequestAct
   const searchResultSchema = z.object({
     data: z.record(z.string(), z.object({ issueCount: z.number().int().nonnegative() })),
   });
-  const batchSize = 92;
+  const batchSize = 25;
   const responses = await Promise.all(
     Array.from({ length: Math.ceil(days.length / batchSize) }, async (_, batchIndex) => {
       const start = batchIndex * batchSize;
