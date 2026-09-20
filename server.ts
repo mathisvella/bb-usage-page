@@ -85,6 +85,10 @@ function addUtcDays(value: Date, days: number): Date {
   return next;
 }
 
+function addUtcMonths(value: Date, months: number): Date {
+  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth() + months, value.getUTCDate()));
+}
+
 async function runGitHubCli(args: string[]): Promise<string> {
   const { stdout } = await execFileAsync("gh", args, {
     timeout: 60_000,
@@ -93,7 +97,11 @@ async function runGitHubCli(args: string[]): Promise<string> {
   return stdout;
 }
 
-/** GitHub search returns at most 1,000 items for one query. */
+/**
+ * GitHub search returns at most 1,000 items per query and has a tighter rate
+ * limit than the core API. Three-month slices retain every PR while keeping a
+ * full year's initial load safely below that rate limit.
+ */
 async function readPullRequestActivity(now = new Date()): Promise<PullRequestActivity> {
   const login = (await runGitHubCli(["api", "user", "--jq", ".login"])).trim();
   if (!login) throw new Error("GitHub is not signed in on this BB host.");
@@ -105,38 +113,45 @@ async function readPullRequestActivity(now = new Date()): Promise<PullRequestAct
     counts.set(utcDay(day), 0);
   }
 
-  const query = `is:pr author:${login} created:${utcDay(firstDay)}..${utcDay(today)}`;
-  const endpoint = `/search/issues?q=${encodeURIComponent(query)}&per_page=100&sort=created&order=asc`;
-  const raw = await runGitHubCli([
-    "api",
-    "--paginate",
-    "--slurp",
-    "-H",
-    "Accept: application/vnd.github+json",
-    endpoint,
-  ]);
-  const pages = z
-    .array(
-      z.object({
-        total_count: z.number().int().nonnegative(),
-        incomplete_results: z.boolean(),
-        items: z.array(z.object({ created_at: z.string().datetime() })),
-      }),
-    )
-    .parse(JSON.parse(raw));
-  const resultCount = pages[0]?.total_count ?? 0;
-  const incomplete = resultCount > 1_000 || pages.some((page) => page.incomplete_results);
-  for (const page of pages) {
-    for (const pullRequest of page.items) {
-      const day = pullRequest.created_at.slice(0, 10);
-      if (counts.has(day)) counts.set(day, (counts.get(day) ?? 0) + 1);
+  const searchResultSchema = z.object({
+    total_count: z.number().int().nonnegative(),
+    incomplete_results: z.boolean(),
+    items: z.array(z.object({ created_at: z.string().datetime() })),
+  });
+  let total = 0;
+  let incomplete = false;
+  for (let periodStart = firstDay; periodStart <= today; ) {
+    const nextPeriod = addUtcMonths(periodStart, 3);
+    const periodEnd = new Date(Math.min(addUtcDays(nextPeriod, -1).getTime(), today.getTime()));
+    const query = `is:pr author:${login} created:${utcDay(periodStart)}..${utcDay(periodEnd)}`;
+    const queryPrefix = `/search/issues?q=${encodeURIComponent(query)}&per_page=100&sort=created&order=asc`;
+    let pages = 1;
+    for (let page = 1; page <= pages; page += 1) {
+      const raw = await runGitHubCli([
+        "api",
+        "-H",
+        "Accept: application/vnd.github+json",
+        `${queryPrefix}&page=${page}`,
+      ]);
+      const result = searchResultSchema.parse(JSON.parse(raw));
+      if (page === 1) {
+        total += Math.min(result.total_count, 1_000);
+        pages = Math.min(Math.ceil(result.total_count / 100), 10);
+        incomplete ||= result.total_count > 1_000;
+      }
+      incomplete ||= result.incomplete_results;
+      for (const pullRequest of result.items) {
+        const day = pullRequest.created_at.slice(0, 10);
+        if (counts.has(day)) counts.set(day, (counts.get(day) ?? 0) + 1);
+      }
     }
+    periodStart = nextPeriod;
   }
 
   return {
     login,
     days: [...counts].map(([day, count]) => ({ day, count })),
-    total: Math.min(resultCount, 1_000),
+    total,
     incomplete,
   };
 }
@@ -336,8 +351,8 @@ export default async function plugin(bb: BbPluginApi) {
       });
       return resolveUsage(merged);
     },
-    async getPullRequestActivity({ force }) {
-      if (!force && pullRequestCache && pullRequestCache.expiresAt > Date.now()) {
+    async getPullRequestActivity() {
+      if (pullRequestCache && pullRequestCache.expiresAt > Date.now()) {
         return pullRequestCache.value;
       }
       const value = await readPullRequestActivity();
