@@ -148,7 +148,6 @@ export const EMPTY_TOTALS: UsageTokenTotals = {
 export const PROVIDER_ORDER: readonly UsageProviderKind[] = [
   "codex",
   "claude",
-  "pi",
   "cursor",
 ];
 
