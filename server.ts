@@ -4,6 +4,8 @@ import { promisify } from "node:util";
 import { z } from "zod";
 
 import { isValidTimeZone, makeWindow } from "./lib/format";
+import { liveStatusSchema, type LiveStatus } from "./lib/live-status";
+import { readLiveStatus } from "./lib/live-status-reader";
 import { USAGE_DATA_DIR } from "./lib/plugin-data";
 import {
   applyEnvironmentThreads,
@@ -49,6 +51,10 @@ const daySchema = z
   );
 
 export const rpcContract = defineRpcContract({
+  getLiveStatus: {
+    input: z.object({ force: z.boolean().optional() }).strict(),
+    output: liveStatusSchema,
+  },
   getUsage: {
     input: z
       .object({
@@ -295,6 +301,7 @@ export default async function plugin(bb: BbPluginApi) {
     log: (message) => bb.log.info(message),
   });
   let pullRequestCache: { value: PullRequestActivity; expiresAt: number } | null = null;
+  let liveStatusCache: { value: LiveStatus; expiresAt: number } | null = null;
 
   async function cursorOptions() {
     const values = await settings.get();
@@ -324,6 +331,13 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.rpc.register(rpcContract, {
+    async getLiveStatus({ force }) {
+      if (!force && liveStatusCache && liveStatusCache.expiresAt > Date.now())
+        return liveStatusCache.value;
+      const value = await readLiveStatus();
+      liveStatusCache = { value, expiresAt: Date.now() + 60_000 };
+      return value;
+    },
     async getUsage({ sinceDay, untilDay, timeZone, force }) {
       const { merged } = await scanner.readSummary({
         sinceDay,

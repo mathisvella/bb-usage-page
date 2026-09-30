@@ -4,6 +4,7 @@ import { ReloadIcon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import type { rpcContract } from "../../server";
 import type { MergedUsage, UsageChartMetric } from "../../lib/types";
+import type { LiveStatus } from "../../lib/live-status";
 import { PROVIDER_ORDER } from "../../lib/types";
 import {
   enumerateDays,
@@ -17,6 +18,7 @@ import {
 import { PROVIDER_COLOR, PROVIDER_LABEL, ProviderMark } from "./providers";
 import { PullRequestHeatmap, type PullRequestActivity } from "./pull-request-heatmap";
 import { UsageChartLegend, UsageProviderChart } from "./usage-chart";
+import { LiveStatusSection } from "./live-status";
 
 const WINDOW_OPTIONS = [
   { days: 7 as const, label: "7 days" },
@@ -45,6 +47,9 @@ export function UsagePage() {
   const [pullRequests, setPullRequests] = useState<PullRequestActivity | null>(null);
   const [pullRequestError, setPullRequestError] = useState<string | null>(null);
   const [pullRequestReloadKey, setPullRequestReloadKey] = useState(0);
+  const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
+  const [liveStatusError, setLiveStatusError] = useState<string | null>(null);
+  const [liveStatusReloadKey, setLiveStatusReloadKey] = useState(0);
   const hasLoadedRef = useRef(false);
   const forceRefreshRef = useRef(false);
   const forcePullRequestRefreshRef = useRef(false);
@@ -123,6 +128,19 @@ export function UsagePage() {
       cancelled = true;
     };
   }, [rpc, pullRequestReloadKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLiveStatusError(null);
+    void rpc.call("getLiveStatus", { force: liveStatusReloadKey > 0 })
+      .then((result) => {
+        if (!cancelled) setLiveStatus(result);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setLiveStatusError(err instanceof Error ? err.message : String(err));
+      });
+    return () => { cancelled = true; };
+  }, [rpc, liveStatusReloadKey]);
 
   useEffect(() => {
     const nextMidnight = new Date();
@@ -218,6 +236,7 @@ export function UsagePage() {
                 forcePullRequestRefreshRef.current = true;
                 setReloadKey((value) => value + 1);
                 setPullRequestReloadKey((value) => value + 1);
+                setLiveStatusReloadKey((value) => value + 1);
               }}
               aria-label="Refresh usage"
               disabled={refreshing}
@@ -230,6 +249,8 @@ export function UsagePage() {
             </button>
           </div>
         </div>
+
+        <LiveStatusSection status={liveStatus} error={liveStatusError} />
 
         {showSkeleton ? (
           <UsageSkeleton />
